@@ -1,109 +1,156 @@
-# RWKV-8 "Heron" — complete pure-Python implementation for Google Colab T4
+# RWKV-8 "Heron" — v2, the 2026 community upgrade round
 
-An from-scratch, frontier-grade implementation of **RWKV-8** — the architecture released in
-[BlinkDL/RWKV-LM `RWKV-v8`](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v8) — written
-**completely in Python** (PyTorch + numba, zero custom CUDA/C++), tuned to train and run on a
-**free Colab T4 GPU**.
+An from-scratch implementation of **RWKV-8** — the RWKV-7g time-mix, **ROSA**
+(Rapid Online Suffix Automaton — retrieval beyond attention) and **DeepEmbed** —
+written completely in Python (PyTorch + numba, zero custom CUDA/C++), tuned to
+train and run on a **free Colab T4 GPU**.
 
-```
-RWKV-8 "Heron"  =  RWKV-7g time-mix        (recurrent generalized delta rule, exact kernel port)
-                 + ROSA                     (Rapid Online Suffix Automaton — retrieval beyond attention)
-                 + DeepEmbed                (per-token FFN modulation)
-```
+**v2** is a full upgrade round over the original 2,100-line implementation:
+every fix and feature below is validated by `test_rwkv8.py` (31 tests, CPU-only,
+`python -m pytest test_rwkv8.py -v`).
+
+---
+
+## What changed in v2
+
+### Correctness fixes (bugs found in the v1 code)
+1. **`RosaLM` RNN-mode state bug** — `_forward_rnn` never wrote the token-shift
+   states (`x_prev_a/b/c`) back into the state dict, so RNN-mode silently
+   diverged from GPT-mode for the pure-ROSA LM. Fixed; both models now verify
+   GPT == RNN to fp32 round-off.
+2. **RNN-mode with batch > 1** — v1 shared the G per-group QKV automata across
+   batch rows and stepped only batch element 0's symbols. v2 steps B*G live
+   automata (`BatchedQKVSams`), validated step-for-step against per-object
+   automata.
+3. **Sampler** — v1 applied temperature *after* top-p/top-k (wrong
+   distribution) and could raise `IndexError` from `searchsorted` when
+   `top_p → 1`. v2 samples in log space (temperature first), clamps the
+   cumulative index, and adds repetition/presence penalties and min-p.
+4. **Resume-able checkpoints** — v1 saved only weights+config. v2 saves
+   optimizer, scheduler, GradScaler, step, best-val; `resume=True` continues
+   exactly where the run stopped.
+5. **Robust eval** — `eval_bpc` now scores deterministic evenly-spaced windows
+   (variance-free comparisons) and restores the async flags in a `finally`.
+6. **`generate` is O(T)** — prefill once through the stateful path instead of
+   recomputing the whole context per token (v1 was O(n²) with a silent 2048
+   cap). Seeded, with penalties; GPT-mode kept as a validation reference.
+
+### Performance
+7. **Chunk-parallel WY/UT scan** (`rwkv7g_scan(..., mode="chunked"|"auto")`) —
+   the per-timestep Python loop is replaced by an exact chunk-parallel form
+   (cumulative per-channel decays, a strictly-upper UT system inverted by
+   log-doubling, and 8 small matmuls per chunk). Validated exact vs the
+   sequential loop in **fp64 forward AND backward** (atol 1e-9) and to fp32
+   round-off (~1e-5) under the model's structural `ww ∈ (0.545, 1)` bound.
+   ~T/chunk× fewer kernel launches; per-chunk gradient checkpointing kept.
+8. **Exact GPU-side ROSA backend** (`rosa_backend="gpu"`) — a strided
+   window-equality matcher (incremental `eq_L[t,s] = AND q[t-i]==k[s-i]`, no
+   hashing, no collisions) that reproduces the SAM retrieval semantics
+   (endpos-class property) for all match lengths ≤ `rosa_gpu_cap` (64 default,
+   matching the numba engine's own LEN_CAP). Runs on any device; the CPU SAM
+   engine remains the default and the fallback.
+9. **numba multicore + batched live automata** — batch kernels were already
+   `prange`-parallel; v2 adds the flat-array `_sam_qkv_step_rows_nb` kernel
+   that advances N independent automata one step per call, replacing the
+   Python `for g in range(G)` decode loops. Storage grows geometrically;
+   `dump()/load()` serializes everything.
+10. **`torch.compile`** — one config flag (`compile_model=True`) compiles the
+    block stack.
+
+### Modeling
+11. **Soft-ROSA** (`rosa_grad="soft"`) — retrieval over the top-M suffix-link
+    match candidates with a learned length prior (`len_scale`, `len_bias`):
+    exact gradients into the weight read positions (p-weighted scatter) and
+    the length prior; STE surrogate for routing bits; candidate 0 is the hard
+    retrieval, so `soft(M=1)` is bit-identical to `ste` (tested).
+12. **Tokenizer support** (`Tokenizer`) — `bytes` (with special tokens at
+    ids ≥ 256), `tiktoken`, or any HuggingFace tokenizer. Everything
+    downstream (ROSA automata, embeddings) is token-id-agnostic.
+13. **Chat bookmark tokens** — `<sys>/<user>/<asst>/<C_begin>/<C_end>` wrap
+    each conversational round so token-ROSA retrieves any round exactly
+    ([1]'s RWKV-8 notes), wired through `encode_chat` and the chat CLI.
+14. **Inner monologue** (experimental) — `inner_monologue=True` adds
+    `Emb(ROSA(z))` of the model's own lagged argmax outputs to its input.
+15. **Scale presets** — `RWKV8Config.preset("demo"|"t4max"|"golf16mb"|"test")`,
+    per-layer `rosa_bits`, and dropout (`drop_p`).
+
+### Training
+16. **Schedules** — WSD (warmup-stable-decay) and cosine-with-restarts beside
+    the default cosine; **weight-decay parameter groups** (norms, mixing
+    scalars, gates, LoRA and embeddings decay-free); **gradient accumulation**.
+17. **DDP** — `torchrun --nproc_per_node=N ...` + `ddp=True`; rank-0-only
+    logging/checkpointing.
+18. **Logging** — `RunLogger`: always CSV, optional TensorBoard / wandb;
+    loss/bpc/lr/tok-s/grad-norm.
+19. **EMA** — weight-averaged validation (identity-based, so the tied
+    emb/head weight is handled correctly).
+20. **Sequential data mode** — `SequentialData` walks the corpus like a
+    compressor instead of random crops.
+
+### Inference & serving
+21. **Chat CLI** — streaming RNN-mode REPL with system prompt, bookmarks,
+    penalties, and `save` to checkpoint the conversation state.
+22. **RNN-state save/load** — RWKV states + token automata + every live QKV
+    suffix automaton serialize to disk; restored states are bit-exact (tested).
+23. **Quantization** — int8 dynamic + fp16 with a measured quality-delta
+    report (`quant_quality_report`).
+24. **Export** — safetensors (with graceful torch.save fallback) and ONNX:
+    ROSA indices are exported as *inputs*, exporting the entire neural core
+    cleanly (the suffix automata are integer algorithms that run on CPU — the
+    same split the async training pipeline already uses).
+
+### Evaluation
+25. **Benchmark harness** — `eval_bpc_full` (whole-val sliding-window bpc),
+    `per_position_losses` (state warm-up curve), `niah_sweep`
+    (1k → 100k needle retrieval; all True by design).
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `rwkv8_rosa_colab.ipynb` | **Start here.** Self-contained Colab notebook: upload → `Runtime → Run all` (T4). Full run ≈ 60–90 min, `FAST=True` ≈ 20–30 min. |
-| `rwkv8.py` | The complete implementation (~2000 lines, commented) — also embedded in the notebook via `%%writefile`. |
-
-## What's inside
-
-- **Exact ROSA engine** — online suffix automata for plain token ROSA and QKV-ROSA
-  (4-bit symbol groups), validated bit-for-bit against the reference's brute-force
-  specification on hundreds of random streams. numba-JIT kernels (GIL-released) at
-  ~25M symbol-steps/s with an exact pure-Python fallback; integer-only, FPGA-friendly
-  flat transition tables; match truncation `K`; stateful automata for O(1)-per-token
-  RNN-mode inference.
-- **RWKV-7g time-mix** — a bit-exact pure-PyTorch port of `wkv7_cuda.cu`
-  (`S ← S·diag(e^(−e^w)) − (S·kk)⊗(kk·a) + v⊗k; y = S·r`), with chunk-wise gradient
-  checkpointing and fp32 state accumulation. Chunked == unchunked == manual loop,
-  gradients exact to 0.0, state carry exact.
-- **Hybrid ROSA backward pass** — exact gradients for payloads; **the value-read
-  scatter gradient equals BlinkDL's flip-every-bit counterfactual VJP with cosine
-  similarity 1.0000** (validated in the notebook); STE surrogate for routing bits
-  (`grad_mode="ste"`, default), full exact counterfactual (`grad_mode="exact"`),
-  and the reference's detached-branch behaviour (`grad_mode="none"`).
-- **Two model families** — `RWKV8Heron` (full RWKV-8: time-mix ∥ ROSA + DeepEmbed FFN)
-  and `RosaLM` (pure-ROSA LM, `rosa4bitLM`-style). Both with GPT-mode and stateful
-  RNN-mode (verified equal to ~1e-6).
-- **Async CPU–GPU pipeline** — token-ROSA indices prefetched on a background thread for
-  the next batch; each block's QKV-ROSA retrieval runs on the CPU concurrently with the
-  GPU time-mix (the ROSA-Tuning design).
-- **Training + eval** — enwik8 (raw bytes, 90M/5M split), warmup-cosine AdamW, bits-per-char
-  metrics, checkpoints, sampling; parameter-golf artifact report (the default 7.1M-param
-  Heron fits the 16 MB fp16 budget).
-- **Showcase demos** (all reproduce reference behaviours):
-  - **Counting** — the faithful `251018` recipe; reaches **loss ≈ 0.245** (reference: ~0.25).
-  - **MQAR** — parameter-free ROSA: **100%** at any context length; trained ablation:
-    RWKV-7g alone 1.6% (chance) vs **RWKV-7g + ROSA 100%**.
-  - **Reverse digits** — the `251105` recipe (L4-C32, 39.6K params); trains toward the
-    reference's 99.6% with GPU-scale steps.
-  - **Standalone ROSA compressor** — zero parameters, zero training: ~3.09 bpc on enwik8
-    (beats a plain bigram model).
-  - **Needle-in-a-haystack** — retrieved verbatim at any distance, by design.
+| `rwkv8_rosa_colab.ipynb` | **Start here.** Colab notebook: upload → `Runtime → Run all` (T4). Original sections 1–10 + new v2 sections 10–13. |
+| `rwkv8.py` | The complete v2 implementation (~3,900 lines, commented). |
+| `test_rwkv8.py` | 31-test validation suite (CPU-only). |
 
 ## Quick start (local, no Colab)
 
 ```python
 import rwkv8 as m
 
-cfg  = m.RWKV8Config(vocab_size=256, n_layer=6, n_embd=256)   # 7.1M params
+cfg  = m.RWKV8Config.preset("demo")               # or "t4max", "golf16mb"
 model = m.RWKV8Heron(cfg)
 
 idx  = torch.randint(0, 256, (4, 256))
-logits = model(idx)                       # GPT-mode
-loss = F.cross_entropy(logits.reshape(-1, 256), idx[:, 1:].reshape(-1)); loss.backward()
-
-state = model.init_state(1)               # RNN-mode: O(1)/token, unbounded context
+logits = model(idx)                               # GPT-mode
+state = model.init_state(1)                       # RNN-mode: O(1)/token
 logits, state = model(idx[:, :1], state=state)
 
 data = m.ByteData(m.download_enwik8("data"))
-m.train_model(model, data, steps=3000, device="cuda")         # trainer w/ async ROSA
-toks = m.generate_rnn(model, list(b"First Citizen"), n_new=200)
+m.train_model(model, data, steps=3000, sched="wsd", ema_decay=0.999,
+              device="cuda", logger=m.RunLogger(out_dir="runs/demo"))
+
+toks = m.generate(model, list(b"First Citizen"), n_new=200, mode="rnn")
+m.niah_sweep(model, filler_lens=[1_000, 100_000])
 ```
 
-## Repository-by-repository influence map
+CLI: `python rwkv8.py train|chat|generate|benchmark|export ...`
+(`python rwkv8.py --help`).
 
-| Repository | What it contributed here |
-|---|---|
-| [BlinkDL/RWKV-LM · RWKV-v8](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v8) | Everything foundational: the RWKV-7g recurrence (`wkv7_cuda.cu`), ROSA (plain/QKV/4-bit, `samx_qkv_slow`, `rosa_slow_ref`), `Emb(ROSA(x))`, DeepEmbed, the demo tasks and their reference numbers, the counterfactual gradient |
-| [xiaoiecc/qkv-rosa-fast-exact-backward](https://github.com/xiaoiecc/qkv-rosa-fast-exact-backward) | n-bit hard codes; the separate learned no-match payload `emb0`; exact counterfactual VJP as a first-class mode (`grad_mode="exact"`, numba-accelerated) |
-| [wjie98/rosa_soft](https://github.com/wjie98/rosa_soft) | exact hard forward + surrogate backward; the value-read scatter gradient — which we show is *exactly* the counterfactual VJP (cosine 1.0000) |
-| [johanwind/wind_rosa](https://github.com/johanwind/wind_rosa) | match truncation `K` in the engine; finite-difference gradient framing; O(1) lookups with linear state |
-| [zyaaa-ux/ROSA-Tuning](https://github.com/zyaaa-ux/ROSA-Tuning) (arXiv 2602.02499) | binary discretization; counterfactual gradients; the **async CPU–GPU pipeline** (background-thread retrieval, batch prefetching) |
-| [aabbdev/rosa](https://github.com/aabbdev/rosa) | learned read gate before retrieval enters the stream; match-length calibration (our `len_emb` buckets) |
-| [bcml-ai/rosa-plus](https://github.com/bcml-ai/rosa-plus) | the statistical backoff idea — our standalone ROSA compressor's Witten–Bell-style length-weighted blending |
-| [KakaruHayate/RWKV8-ROSA-FPGA](https://github.com/KakaruHayate/RWKV8-ROSA-FPGA) | the integer-only, CPU-side, no-float/no-hash design of the engine (flat int32 transition tables) |
-| [Juste-Leo2/ROSA-GPU-RWKV8](https://github.com/Juste-Leo2/ROSA-GPU-RWKV8) | GPU-side ROSA as an alternative engine — documented in the notebook's extensions (on T4, the CPU engine + async pipeline already covers this model class) |
-| [x-0D/RASP](https://github.com/x-0D/RASP) | the ROSA+ / CRF / syntactic-feature extension direction (notebook §10 extensions) |
-| [openai/parameter-golf](https://github.com/openai/parameter-golf) | bits-per-byte evaluation, parameter budgeting, weight tying; the artifact report (default model: 14.2 MB fp16 < 16 MB budget) |
+## Repository map (original contributions — credit these authors)
 
-## Design notes & honest caveats
+See the credits section at the end of the notebook; v2 adds nothing to the
+architecture itself — it is engineering, correctness and tooling work on top
+of [BlinkDL/RWKV-LM RWKV-v8] and the ROSA research community's code.
 
-- **The QKV-ROSA semantics are exact** (same automaton as the reference; validated against
-  brute force). The *retrieved match length* is recomputed exactly as the longest common
-  suffix at the read position — the reference's carried length pointer can overstate, and
-  the reference itself never consumes it.
-- **`grad_mode="none"`** reproduces the reference LM behaviour exactly (the reference's
-  RosaLM builds its branch output from detached tensors — no gradient into the code
-  streams). `"ste"` (default) is our upgrade: exact value-read gradient + STE routing.
-  `"exact"` is BlinkDL's full counterfactual, made practical with numba.
-- **The reverse demo needs GPU-scale steps** to reach the reference's 99.6% (the
-  reference trains far longer than any CPU budget; the notebook trains 4000 steps on T4
-  and prints the trajectory).
-- enwik8 numbers are **raw-byte bpc** (the honest byte-level metric; classic ~1.0 bpc
-  figures use preprocessed text).
-- Not affiliated with the RWKV team. Research/education code, MIT license — please credit
-  the authors in the table above if you build on this.
+## Design notes & honest caveats (v2)
+
+- The WY scan is exact for chunk ≤ 64 (the model's `ww ∈ (0.545, 1)` structural
+  bound keeps e^l in fp32 range); the scan clamps larger chunks automatically.
+- `rosa_backend="gpu"` is exact for match lengths ≤ `rosa_gpu_cap` (64); longer
+  matches fall back to the best shorter one — the numba engine caps its
+  recomputed match length at 64 as well. For strict unbounded exactness keep
+  the CPU engine.
+- Soft-ROSA is a GPT-mode training feature; RNN-mode inference always uses the
+  exact hard single-match retrieval.
+- enwik8 numbers remain raw-byte bpc. Not affiliated with the RWKV team.
+  Research/education code, MIT — please credit the original authors.
